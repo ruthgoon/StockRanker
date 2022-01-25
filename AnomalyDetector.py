@@ -9,7 +9,7 @@ from .StockEngine import StockEngine
 
 class AnomalyDetector:
 
-    def __init__(self, stock_list=False, results_to_return=50):
+    def __init__(self, stock_list=False, results_to_return=750):
         """Detects anomalous stock activity given a stock list.
 
         Parameters:
@@ -30,7 +30,7 @@ class AnomalyDetector:
         Returns:
              - results - A list of result dicts
         """
-        features, historical_data, symbols = self._get_feature_map(
+        features, historical_data, symbols, period = self._get_feature_map(
             time_period=time_period, volume_filter=self.VOLUME_FILTER)
 
         model = IsolationForest(n_estimators=100, random_state=0)
@@ -50,6 +50,7 @@ class AnomalyDetector:
                 continue
             filtered_results.append({
                 'date': latest_date,
+                'period': period,
                 'ticker': item[1],
                 'anomaly_score': item[0],
                 'todays_volume': todays_volume,
@@ -60,9 +61,10 @@ class AnomalyDetector:
             })
         return filtered_results
 
-    def _get_feature_map(self, time_period=False, volume_filter=False):
+    def _get_feature_map(self, time_period=False, volume_filter=False, volatility_filter=False):
         """
         Returns the feature map, historical price info, future prices and the symbol names for the securities
+        time_period (list) :: A list with the first index being the start date and the second index being the end date
         """
         if not self.stocks:
             return False
@@ -74,23 +76,24 @@ class AnomalyDetector:
 
         if not time_period:
             today = datetime.datetime.now()
-            previous = today - datetime.timedelta(days=60)
+            # default to 2 financial weeks
+            previous = today - datetime.timedelta(days=10)
             time_period = [previous, today]
 
         for stock in self.stocks:
-            price_data = self.db.get_stock_prices(
-                stock, time_period=time_period, dataframe=True)
+            price_data = self.db.get_stock_dataframes([stock], time_period)
 
             if type(price_data) == bool and not price_data:
                 continue
             if len(price_data) < 5:
                 continue
 
-            volatility = self.stock_engine.volatility(
+            volatility_5, volatility_20, volatility_all = self.stock_engine.volatility(
                 price_data, dataframe=True)
 
-            if volatility[0] < self.VOLATILITY_FILTER:
-                continue
+            if volatility_filter:
+                if volatility_5[0] < volatility_filter:
+                    continue
 
             stock_feature_dict = self.stock_engine.get_technical_indicators(
                 price_data)
@@ -117,7 +120,7 @@ class AnomalyDetector:
             features, historical, symbols = self._preproc_data(
                 features, historical_price_info, symbol_names)
 
-        return features, historical, symbols
+        return features, historical, symbols, time_period
 
     def _preproc_data(self, features, historical_data, stock_names):
         length_dictionary = collections.Counter(
