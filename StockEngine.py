@@ -5,9 +5,10 @@ import random
 
 import numpy as np
 import pandas
+import requests
 import ta
+import datetime
 import yfinance as yf
-import pyEX as p
 from scipy.stats import linregress, norm
 from stockstats import StockDataFrame
 
@@ -47,8 +48,12 @@ class StockEngine():
             "total_operating_expenses": "Total Operating Expenses",
             "cost_of_revenue": "Cost Of Revenue"
         }
-        self.client = p.Client(
-            api_token="Tpk_7d46b2b9c1dc4fb0b70a27b8602e4961")
+
+        self.IEX_CONFIG = {
+            "iex_test": "your-iex-test-token",
+            "iex_prod": "your-iex-production-token",
+            "selection": "cloud"
+        }
 
     def get_fundamentals(self, ticker):
         """
@@ -71,6 +76,7 @@ class StockEngine():
     def get_financials(self, ticker):
         """
         Fetches financial information pertaining to a ticker
+        TODO: replace with iex API equivalent (yahoo api sucks)
         """
         try:
 
@@ -94,7 +100,7 @@ class StockEngine():
         except Exception as e:
             return False
 
-    def get_technical_indicators(self, df, n_timeframe=7):
+    def get_technical_indicators(self, df, n_timeframe=5):
         """
         Reads a dataframe and returns the technical indicators. These differ from the standalone
         TA functions (macd, rsi, etc.) in that they are optimized for dataframes
@@ -169,9 +175,6 @@ class StockEngine():
         slope_vol, r_value_vol, p_value_vol = self.regressive_slope(
             volume_returns[-n_timeframe:])
 
-        if not slope_vol:
-            return False
-
         techs["volume_returns"] = volume_returns[-n_timeframe:] + [
             slope_vol, r_value_vol, p_value_vol]
 
@@ -180,7 +183,7 @@ class StockEngine():
     def regressive_slope(self, df):
         x_axis = np.arange(len(df))
         if x_axis.size == 0:
-            return False, False, False
+            return 0, 0, 0
         regression_model = linregress(x_axis, df)
         slope, r_val, p_val = round(regression_model.slope, 3), round(
             abs(regression_model.rvalue), 3), round(regression_model.pvalue, 4)
@@ -210,6 +213,48 @@ class StockEngine():
         except:
             return False
 
+    def iex_get_data(self, tickers, start_time=False, end_time=False):
+        """
+        Retrieves time series data from IEXCloud given the starting date
+        and the ending date to get data from
+
+        Parameters:
+            - ticker (str|list)
+            - start_time (datetime) :: The starting datetime 
+            - end_time (date) :: The ending datetime
+        """
+        if isinstance(tickers, str):
+            tickers = [tickers]
+
+        if not isinstance(tickers, list):
+            raise Exception("tickers must be of type list")
+
+        results = {}
+
+        for tick in tickers:
+            # generate the url & send the request
+            endpoint = self._iex_api_url(tick, start_time, end_time)
+            resp = requests.get(endpoint)
+            json = resp.json()
+            if not isinstance(json, list):
+                # error parsing
+                if "error" in json:
+                    results[tick] = None
+                continue
+
+            results[tick] = []
+
+            for r in json:
+                results[tick].append({
+                    "date": datetime.datetime.fromtimestamp(r['date']/1000.0),
+                    "open": r['open'],
+                    "high": r['high'],
+                    "low": r['low'],
+                    "close": r['close'],
+                    "volume": r['volume']
+                })
+        return results
+
     def macd_indicator(self, timeseries):
         """
         Using the MACD signal line crossover indicator, this function
@@ -231,28 +276,26 @@ class StockEngine():
         values = []
         for i in range(1, len(signal)):
             if macd[i] > signal[i] and macd[i - 1] <= signal[i - 1]:
-                values.append("BUY")
+                values.append(1)
             elif macd[i] < signal[i] and macd[i - 1] >= signal[i - 1]:
-                values.append("SELL")
+                values.append(-1)
             else:
-                values.append("HOLD")
+                values.append(0)
 
-        return macd.to_dict(), signal.to_dict(), values
+        return macd.tolist(), signal.tolist(), values
 
     def rate_of_return(self, timeseries):
         """
         Calculates the rate of return over the timeseries.
         """
         ror = []
-        if(type(timeseries) == list):
+        if(isinstance(timeseries, list)):
             for i in range(1, len(timeseries)):
                 if(timeseries[i-1] == 0):
                     ror.append(0)
                 else:
                     ror.append((timeseries[i] / timeseries[i-1]) - 1)
             return ror
-        else:
-            return False
 
     def volume_changes(self, historical_price):
 
@@ -293,7 +336,7 @@ class StockEngine():
         average_vol_last_twenty_days = np.mean(
             [volume_by_date_dictionary[date] for date in all_dates[1:20]])
 
-        return latest_data_point, _fmt_num(today_volume), _fmt_num(average_vol_last_five_days), _fmt_num(average_vol_last_twenty_days)
+        return latest_data_point, today_volume, average_vol_last_five_days, average_vol_last_twenty_days
 
     def volatility(self, timeseries, timeframe=252, dataframe=False):
         """
@@ -306,8 +349,12 @@ class StockEngine():
         if dataframe:
             close_price = list(timeseries["close"])
             volatility_five_bars = np.std(close_price[-5:])
-            volatility_twenty_bars = np.std(close_price[-20:])
+            if len(close_price) >= 20:
+                volatility_twenty_bars = np.std(close_price[-20:])
+            else:
+                volatility_twenty_bars = False
             volatility_all = np.std(close_price)
+
             return volatility_five_bars, volatility_twenty_bars, volatility_all
 
         ror = self.rate_of_return(timeseries)
@@ -445,15 +492,32 @@ class StockEngine():
             timeseries = pandas.DataFrame(timeseries, columns=['Close'])
         val = StockDataFrame.retype(timeseries)
         ema = val['tema']
-        return ema.to_dict()
+        return ema.tolist()
 
     def bol_indicator(self, timeseries):
+        """
+        Gets the bollinger bands upper, lower and median bounds
+
+        Returns:
+        upper, lower, boll (lists) :: The upper bound, lower bound and median
+        """
         if type(timeseries) == list:
             timeseries = pandas.DataFrame(timeseries, columns=['Close'])
 
         val = StockDataFrame.retype(timeseries)
-        bol = val['boll']
-        return bol
+        return val["boll_ub"].tolist(), val["boll_lb"].tolist(), val["boll"].tolist()
+
+    def df_lis(self, df, is_live=False):
+        """
+        Dataframe version of the lis
+        """
+        cols = ["open", "high", "low", "close", "volume"]
+        results = []
+        for col in cols:
+            df_list = df[col].tolist()
+            lis = self._lis(df_list)
+            results.append(lis)
+        return results
 
     def _lis(self, arr):
         """
@@ -516,3 +580,23 @@ class StockEngine():
                 increase_rate = pchange
                 rank = i
         return increase_rate, rank
+
+    def _iex_api_url(self, ticker, start_date=False, end_date=False):
+        base_url = "https://{}.iexapis.com/stable/time-series/HISTORICAL_PRICES/{}"
+        base_url = base_url.format(self.IEX_CONFIG['selection'], ticker)
+
+        if start_date:
+            if isinstance(start_date, datetime.datetime):
+                start_date = datetime.datetime.strftime(start_date, "%Y-%m-%d")
+            base_url += "?from={}".format(start_date)
+
+        if end_date:
+            if isinstance(end_date, datetime.datetime):
+                end_date = datetime.datetime.strftime(end_date, "%Y-%m-%d")
+            base_url += "?" if not start_date else "&"
+            base_url += "to={}".format(end_date)
+
+        base_url += "?" if not (start_date or end_date) else "&"
+        base_url += "token={}".format(self.IEX_CONFIG['iex_prod'])
+
+        return base_url
