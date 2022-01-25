@@ -1,256 +1,195 @@
 # pylint: disable=import-error
-from .LoaderComponents import Components
-from .RankDB import RankDB
+import ast
+import datetime
 import json
 import os
+import random
 import time
-import redis
-import faulthandler
 import zlib
-import datetime
-import ast
-import pandas as pd
+from timeit import default_timer as timer
+
+import modin.pandas as pd
 import numpy as np
+import redis
 
-
-class AbstractTransformer(ast.NodeTransformer):
-    """
-    Because ast.literal_eval cannot parse the byte() primitive
-    type in python, we need to institute this abstract syntax tree
-    hack to brute force the AST to visit our bytes
-    """
-    ALLOWED_NAMES = set(['Bytes', 'None', 'False', 'True'])
-    ALLOWED_NODE_TYPES = set([
-        'Expression',
-        'Tuple',
-        'Call',
-        'Name',
-        'Load',
-        'Constant',
-        'Str',
-        'Bytes',
-        'Num',
-        'List',
-        'Dict',
-        'UnaryOp',
-        'USub'
-    ])
-
-    def visit_name(self, node):
-        if not node.id in self.ALLOWED_NAMES:
-            raise RuntimeError(
-                "Name access to {} is not allowed".format(node.id))
-
-        return self.generic_visit(node)
-
-    def generic_visit(self, node):
-        nodetype = type(node).__name__
-        if nodetype not in self.ALLOWED_NODE_TYPES:
-            raise RuntimeError("Invalid nodetype {}".format(nodetype))
-
-        return ast.NodeTransformer.generic_visit(self, node)
+from .LoaderComponents import Components
+from .RankDB import RankDB
 
 
 class DataLoader:
 
-    def __init__(self, ranking_save_path=False):
+    def __init__(self, save_directory=False):
         """
-        The DataLoader is responsible for loading the Predictive GAN models and 
+        The DataLoader is responsible for loading the Predictive GAN models and
         creating and keeping track of the ranked training data.
 
         Parameters:
-            - model_save_path :: The full path to the directory to save the ranked training data 
+            - save_directory :: The full path to the directory to save the ranked training data
         """
-        self.save_path = ranking_save_path
-        self.ast_transformer = AbstractTransformer()
+        self.save_path = "/path/to/save/path/" if not save_directory else save_directory
         self.components = Components()
         self.db = RankDB()
-        self.cwd = os.path.dirname(os.path.realpath(__file__))
-        with open("{}/DataLoaderConfig.json".format(self.cwd)) as f:
-            self.config = json.load(f)
+        self.redis = redis.Redis(host="localhost")
 
-    def create_ranking(self, tickers=False, periods=False, db_cache=True, cache_location=False, newest_first=False):
+    def create_ranking(self, periods=False, num_workers=12, is_live=False):
         """
-        This function handles the main ranking system by going through each available week (or starting
-        at and ending at the specified period) and computing the following for each week:
-            - Stock Price Component (High, Low, Average Open, Average Close, Growth W/W, Rate of Return LIS, Volatility)
-            - Technical Component (MACD, Bolling Band, EMA, RSI, Stochastic Oscillator, Accumulative Distribution, Ease of Movement, CCI, Daily Log Return, Volume Returns)
-            - Market News Component (Avg Sentiment, Causal Link Exploration, Movement Predictors)
-            - Predictive Component (TSGAN, ARIMA, TreeModel, Stumpy Matrix, Discounted Cash Flow, Anomalous Activity)
-
-
-        Each stock will be ranked according to each other stock and the stocks that heuristically have 
-        grown the most, are the most stable, have the most stable and highest market opinion sentiment, and
-        are predicted to grow and to be stable are ranked higher than those that do not fulfill these attributes.
-        These metaparameters can be tweaked in the DataLoaderConfig.json configuration file.
-
-        Once ranked, each stock can then be clustered together will like stocks to make portfolios/benchmarks 
-        of like stocks. In total, there are 26 features that each stock possesses.
-
-        TODO
-            - finish tsgan and add it to the Predictive Components
-            - fix ARIMA and add it to the Predictive Components
-            - Finish CausalLink, MovementPredictor and at them to the Market News Component
+        Creates a series of weekly rankings and extracts, ranks, and serializes the features for every stock that exists
+        for that week. Uses a multiprocess pool worker
 
         Parameters:
-            - tickers :: A list of tickers to rank. If False, ALL tickers will be ranked
-
-            - period :: A list with the 0th index being the starting date and the 1st index being the ending. If
-                        False, the latest week for all tickers listed will be used
-
-            - db_cache :: If true, each stocks rank for each week will be cached to the database. If False, they will
-                       outputted to the cache_location
-
-            - cache_location :: If db_cache is false this denotes the directory location where the ranked weekly
-                                training data will be stored
-
-
+            - period (list) :: A list of lists with each sublist consisting of 2 datetimes, one the start of the week and one the
+                               end of the week
         Returns:
-            - Boolean - True if successfully executed, False if not
+            - True if the ranking has finished, False if it hasn't
         """
-        # faulthandler.enable()
-        debug_logger = redis.Redis(host='localhost', port=6379, db=0)
-        if type(tickers) == str:
-            tickers = tickers.split(",")
 
-        if not tickers:
-            tickers = self.db.get_stock_list()
+        if periods and not isinstance(periods, list):
+            raise ValueError("Period must be of type list")
 
-        # if a time period is not specified we start from the starting time period
-        # defined in the config and go to the present. We then splice the dates so
-        # we're left with an array of tuples with each tuple being a start and end date
-        # (inclusive)
+        if periods:
+            # type check the period to make sure its not invalid or anything
+
+            if len(periods) == 0:
+                raise ValueError("Periods must have length >= 1")
+            if not isinstance(periods[0], list):
+                raise ValueError(
+                    "Period must contain sublists containing 2 indices each")
+
         if not periods:
+
+            # auto generate the periods going from todays date to 2015-01-01 (HERE)
+            end_date = datetime.datetime.strptime("2021-01-01", "%Y-%m-%d")
+            today = datetime.datetime.now()
+            delta = abs((today - end_date).days)
             periods = []
-            date_start = datetime.datetime.strptime(
-                self.config['General']['OldestTickerTimestamp'], "%Y-%m-%d")
-            date_end = datetime.datetime.now()
-            num_days = (date_end - date_start).days
-            last_date = date_start
-            for i in range(0, num_days, 7):
-                new_date = date_start + datetime.timedelta(days=i)
-                week_list = [
-                    last_date,
-                    new_date
-                ]
-                last_date = new_date
-                periods.append(week_list)
+            prev_date = False
+            for i in range(0, delta, 7):
+                prev_date = today - datetime.timedelta(days=7)
+                periods.append([prev_date, today])
+                today = prev_date
 
-            if newest_first:
-                periods = periods[::-1]
+        periodic_data = []
 
-        else:
-            if type(periods) == list:
-                formatted_periods = []
-                for period in periods:
-                    if len(period) != 2:
-                        raise Exception("Malformed datetime sublist")
-                    start = datetime.datetime.strptime(period[0], "%Y-%m-%d")
-                    end = datetime.datetime.strptime(period[1], "%Y-%m-%d")
-                    formatted_periods.append([start, end])
+        for p in periods:
+            results = self.db.get_stock_dataframes(timeframe=p, live=is_live)
+            periodic_data.append(results)
 
-                periods = formatted_periods
-            else:
-                raise Exception("periods must be a list")
+        for dataframes, period in zip(periodic_data, periods):
+            # start the extraction for each frame in the dataframes list
+            tickers = {}
+            for dataframe in dataframes:
+                comps = {}
 
-        # indx 33
-        for period in periods:
-
-            # we need to pad 3 week intervals for the technical indicators to be working properly.
-            # we only use the tech indicators corresponding with the week_start and week_end days
-
-            week = {
-                'week_start': datetime.datetime.strftime(period[0], "%Y-%m-%d"),
-                'week_end': datetime.datetime.strftime(period[1], "%Y-%m-%d"),
-                'tech_week_start': datetime.datetime.strftime(period[0] + datetime.timedelta(days=5), "%Y-%m-%d"),
-                "tech_week_end": datetime.datetime.strftime(period[1] + datetime.timedelta(days=5), "%Y-%m-%d"),
-                'num_stocks': 0,
-                "ranking": []
-            }
-
-            comps = {}
-            ranking = {}
-            unsorted = []
-            start_time = time.time()
-            for ticker in tickers:
-                debug_logger.set("dload", "{} - {}".format(period, ticker))
-                # check to see if there are results for the stock
-
-                has_results = self.db.has_prices(
-                    ticker, week['week_start'], week['week_end'])
-
-                if not has_results:
+                if len(dataframe) < 5:
                     continue
 
-                week['num_stocks'] = week['num_stocks'] + 1
-                components = {}
-                # calculate each component
-                calculated_comps = {
-                    "predictive": self.components.predictive_component(
-                        ticker, week['week_start'], week['week_end']),
-                    "market": self.components.market_component(
-                        ticker, week['week_start'], week['week_end']),
-                    "technical": self.components.technical_component(
-                        ticker, week['tech_week_start'], week['tech_week_end']),
-                    "stock": self.components.stock_component(
-                        ticker, week['week_start'], week['week_end'])
-                }
+                comps.update(self.components.stock_component(dataframe))
+                comps.update(self.components.technical_component(dataframe))
+                # comps.update(self.components.market_component(dataframe)) fix once article_sentiment_cache is populated
+                tickers[str(dataframe["ticker"][0])] = comps
 
-                # combine into 1 dict and get the weighted score and serialize
-                for key in list(calculated_comps.keys()):
-                    components = self._merge(
-                        components, calculated_comps[key])
+            if not tickers:
+                continue
+            ranked_output = self.heuristic_rank(tickers)
+            save_fp = self.save_path + \
+                "{}_{}.npy".format(period[0].strftime(
+                    "%Y-%m-%d"), period[1].strftime("%Y-%m-%d"))
+            np.save(save_fp, ranked_output, allow_pickle=False)
 
-                weighted_score = self._feature_weight(components)
+    def _extraction_worker(self, dframe_object):
+        """
+        Takes a dataframe object and does some work on it
+        TODO: multiprocessing put off until later because its fucky
+        """
+        num_secs = random.randint(5, 15)
+        time.sleep(num_secs)
+        return len(list(dframe_object.keys()))
 
-                ranking = {
-                    "rank": -1,
-                    "ticker": ticker,
-                    "score": weighted_score,
-                    "components": components
-                }
-                unsorted.append(ranking)
+    def heuristic_rank(self, feature_dictionary, weight_list=False):
+        """
+        Heuristic rank takes a weekly dict of tickers, ranks them based on the parameters defined
+        below and then returns a sorted list of dicts
 
-            # sort the unsorted list of tickers by their "score" keys
-            unsorted = sorted(unsorted, key=lambda k: k['score'], reverse=True)
-            sorted_vals = []
+        Parameters:
+            - dataset (dict) :: The dictionary of features
 
-            # serialize
-            for i, val in enumerate(unsorted):
-                val['rank'] = i + 1
-                for veckey in list(val['components'].keys()):
+        Returns:
+            -
+        """
+        weights = [[0.3, 0.3, 0.2, 0.2], [0.2, 0.2, 0.2, 0.2], [0.5, 0.5]
+                   ] if not weight_list else weight_list
 
-                    if isinstance(val['components'][veckey], pd.DataFrame):
-                        val['components'][veckey] = self._serialize_vector(
-                            val['components'][veckey].to_numpy())
-                    if isinstance(val['components'][veckey], np.ndarray):
-                        val = self._serialize_vector(val['components'][veckey])
-                sorted_vals.append(val)
+        if not isinstance(weights, list):
+            raise ValueError("`weight_list` must be of type list")
 
-            # append it to the week object
-            week['ranking'] = sorted_vals
-            week['average_volume'] = -1.00
+        resultants = []
+        for ticker, val in feature_dictionary.items():
 
-            # check to see if we need to cache the weekly record or if we write it to the output file
-            if not db_cache:
-                if not cache_location or not self.save_path:
-                    raise Exception(
-                        "cache_location must be specified if db_cache is False")
+            # numpy conversion of vectors
+            val = {x: np.array(val[x]) for x in val if x not in [
+                "highest_price", "lowest_price", "avg_open", "avg_close"]}
 
-                spath = self.save_path if self.save_path else cache_location
-                TEMP_DEBUG_FILE = "/home/dan/vestra/src/logs/dloader.log"
-                save_filename = "{}_{}.vtf".format(
-                    week['week_start'], week['week_end'])
-                save_filename = spath + save_filename
-                with open(save_filename, "wb") as f:
-                    serialized = self._serialize_dict(week, compress=True)
-                    f.write(serialized)
+            # (1) Stock Price Components
+            # --------------------------
 
-            else:
-                self.db.cache_training_week(week)
+            # magnitudes between the mean and the max/min values
+            max_mean_magnitude = (val["stock_prices"].max(
+                axis=0) - np.mean(val["stock_prices"], axis=0)) / (val["stock_prices"].max(
+                    axis=0))
+
+            min_mean_magnitude = (np.mean(
+                val["stock_prices"], axis=0) - val["stock_prices"].min(axis=0)) / np.mean(
+                val["stock_prices"], axis=0)
+
+            # mean growth
+            mean_growth = np.mean(val["percent_growth"][1:], axis=0)
+
+            # total stock score
+            stock_score = (np.sum(max_mean_magnitude) * weights[0][0]) - (np.sum(min_mean_magnitude) * weights[0][1]) + (
+                np.sum(mean_growth) * weights[0][2]) - (np.sum(val['avg_volatility']) * weights[0][3])
+
+            # (2) Technical Components
+            # --------------------------
+
+            # calculate the magnitude of divergence between the MACD indicator and the signal
+            div_mag = (val["macd"][1:] - val["signal"][1:]) / val["macd"][1:]
+
+            # bollinger spread (wider == more volatile narrow == less volatile)
+            boll_spread = np.linalg.norm(
+                val["boll_upper"][1:] - val["boll_lower"][1:])
+
+            # distances between boll bands & high/low prices
+
+            high_boll_dist = np.linalg.norm(
+                val["stock_prices"][:, [1]][1:] - np.column_stack(val["boll_upper"][1:]))
+
+            low_boll_dist = np.linalg.norm(
+                val["stock_prices"][:, [2]][1:] - np.column_stack(val["boll_lower"][1:]))
+
+            # average the rsi-5, weigh it and then multiply by the abs of the r-value
+            adjusted_rsi_factor = (100 - np.average(
+                val["rsi-5"][:5], weights=[0.075, 0.075, 0.1, 0.2, 0.5])) * np.abs(val["rsi-5"][7])
+
+            # TODO incorporate more technical indicators here too lazy to do the maff
+
+            # calculate technical indicator component score
+            tech_score = (np.sum(div_mag) * weights[1][0]) - (
+                np.sum(boll_spread) * weights[1][1]) + ((high_boll_dist - low_boll_dist) * weights[1][2]) + (adjusted_rsi_factor * weights[1][3])
+
+            combined_weighted = (
+                stock_score * weights[2][0]) + (tech_score * weights[2][1])
+
+            resultants.append(
+                [ticker, stock_score, tech_score, combined_weighted])
+
+        # sort the resultant list
+        resultants.sort(key=lambda x: x[3])
+
+        return resultants
 
     def unpack_data(self, timeframe=False, is_compressed=True, sum_predicts=False, normalize_vals=False):
         """
+        DEPRECATED
         Unserializes all the .vtf data files and returns a single numpy array that represents each
         stock ticker
 
@@ -261,7 +200,7 @@ class DataLoader:
             is_compressed (bool) :: True if the data needs to be uncompressed before being read into memory
 
             sum_redicts (bool) :: If True, the predictive components (which are numpy arrays) will be converted
-                                  to floats by finding their average volatility and normalizing. Needed when 
+                                  to floats by finding their average volatility and normalizing. Needed when
                                   constructing the graph.
 
             normalize_vals (bool) :: If True, all values will be normalized
@@ -278,6 +217,7 @@ class DataLoader:
         if timeframe:
             if type(timeframe) != list:
                 raise Exception("timeframe must be a list")
+
             if len(timeframe) != 2:
                 raise Exception("timeframe must be of length 2")
             if type(timeframe[0]) == str and type(timeframe[1]) == str:
@@ -329,7 +269,6 @@ class DataLoader:
                             if sum_predicts:
                                 val = np.sum(val)
                         except Exception as e:
-                            print(full_path)
                             continue
 
                     if isinstance(val, list):
@@ -351,9 +290,8 @@ class DataLoader:
 
     def output_letor(self, output_path=False):
         """
-        Takes a list of weeks, or the output of the unpacker, and transforms it into 
-        LETOR formatted files that it saves the file to the output_path 
-        TODO FINISH THIS
+        Takes a list of weeks, or the output of the unpacker, and transforms it into
+        LETOR formatted files that it saves the file to the output_path
         """
         return False
 
@@ -423,7 +361,7 @@ class DataLoader:
         sep = '|'.encode('utf-8')
         i_0 = serialized_arr.find(sep)
         i_1 = serialized_arr.find(sep, i_0 + 1)
-        arr_dtype = serialized_arr[:i_0].decode('utf-8')
+        arr_dtype = serialized_arr[: i_0].decode('utf-8')
         arr_shape = tuple(
             [int(a) for a in serialized_arr[i_0 + 1:i_1].decode('utf-8').split(',')])
         arr_str = serialized_arr[i_1 + 1:]
@@ -435,36 +373,24 @@ class DataLoader:
         return (a[i * k + min(i, m):(i + 1) * k + min(i + 1, m)] for i in range(n))
 
     def _serialize_dict(self, d, compress=False):
-        string = str(d)
-        string_bin = string.encode()
-        if compress:
-            string_bin = zlib.compress(string_bin)
-        return string_bin
+        return json.dumps(d)
 
     def _deserialize_dict(self, serialized_dict, decompress=False):
         if decompress:
             serialized_dict = zlib.decompress(serialized_dict)
-        d = serialized_dict.decode('utf-8')
-        d = d.replace('nan', 'np.nan')
-        decoded_tree = ast.parse(d, mode='eval')
-        self.ast_transformer.visit(decoded_tree)
-        clause = compile(decoded_tree, '<AST>', 'eval')
 
-        # this is the most dangerous bit of code in this entire class. if any bad data is
-        # passed to this class during the deserialization of the ranked training data then
-        # rce is possible
-        decoded_dict = eval(clause, dict(Byte=bytes()))
-        return decoded_dict
+        return_dict = ast.literal_eval(serialized_dict)
+        return return_dict
 
     def _ticker_tokenizer(self, ticker, auto_update=False):
         """
         Takes a alphanumeric ticker and returns a 4 integer long id unique to that ticker. Auto updates
-        depending on whether or not any new tickers were added to the system. Returns the full ticker 
+        depending on whether or not any new tickers were added to the system. Returns the full ticker
         dictionary if ticker=False
 
         Parameters:
             - ticker (str | False) :: The ticker to generate the id for
-            - auto_update (bool) :: If true, it will sync with the database and automatically update the 
+            - auto_update (bool) :: If true, it will sync with the database and automatically update the
                                     ticker list. Super slow
         """
         ticker_mapping = os.path.join(self.save_path, "ticker_mapping")
