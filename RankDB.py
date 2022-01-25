@@ -1,4 +1,3 @@
-import pandas as pd
 import pymysql
 import datetime
 from pandas import DataFrame
@@ -19,7 +18,7 @@ class RankDB():
     def __init__(self):
 
         self.credentials = ['localhost', 'username',
-                            'password', 'vestra']
+                            'password', 'db']
         self.db = connect(
             creator=pymysql,
             host=self.credentials[0],
@@ -31,85 +30,61 @@ class RankDB():
             cursorclass=pymysql.cursors.DictCursor
         )
 
-    def get_stock_prices(self, ticker, time_period=False, limit=False, time_normalized=False, dataframe=False):
+    def get_stock_dataframes(self, tickers=False, timeframe=False, limit=False, live=False):
         """
-        Gets the stock prices given a ticker and the time period
-        TODO: Add filters
+        Returns a dataframe of stock OHLCV information.
 
         Parameters:
-            - ticker :: The ticker for which to get the stock data (string)
-            - time_period :: a list with the 0th index being the starting time string and the
-                             first index being the ending date string (not inclusive). Note*
-                             that the strings must be in the "YYYY-MM-DD HH:mm:ss" format
-            - time_normalized :: If True, all gaps in the data will be normalized with NaN values
-            - limit :: The limit is how many values to
-            - dataframe :: If true, a pandas dataframe object will be returned
+            - tickers (False|list) :: If False, every ticker available will be used
+            - timeframe (False|list) :: If defined, should be a list with the first value being the start date and the 
+                                        second vaue being the end date. The timevalues should be either strings or datetime
+                                        values. If live=false, they should be in the form %Y-%m-%d. If live=True, they
+                                        should be in the format %Y-%m-%d_%H:%M:%S
+            - limit (False|int) :: How many results to return. If False all results will be returned
+            - live (Boolean) :: If true, data from the live_stock_data table will be queried. If False, data from the 
+                                stock_data_table is queried
+
+        Returns:
+            - frames (dict) :: A dictionary of Dataframes with each key being the ticker of the corresponding dataframe.
+                               Dataframes have the following columns: [date, open, high, low, close, volume]
         """
         cursor = self.db.cursor()
-        sql = "SELECT `date`, `open`, `high`, `low`, `close`, `volume` FROM `stock_data` WHERE `ticker` = '{}'".format(
-            ticker)
 
-        if time_period:
+        if not tickers:
+            tickers = self.get_stock_list()
+            if not tickers:
+                raise ValueError("Tickers not found, DB Issue??")
 
-            if type(time_period) != list or len(time_period) != 2:
-                return False
+        if live:
+            select_query = "SELECT `ticker`, `timestamp`, `open`, `bid`, `bid_size`, `ask`, `ask_size`, `close`, `volume`, `market_cap`, `change`, `percent_change` FROM `live_stock_data` WHERE `ticker` = %s"
+        else:
+            select_query = "SELECT `ticker`, `date`, `open`, `high`, `low`, `close`, `volume` FROM `stock_data` WHERE `ticker` = %s "
 
-            if not time_period[0]:
+        if timeframe:
+            # TODO
+            # this does not deal with live stock data rewrite the last 2 placeholders to allow for granular time
+            # increments/decrements of 5 seconds
+            select_query += 'AND (`{}` BETWEEN "{}" AND "{}")'.format(
+                "date" if not live else "timestamp", timeframe[0].strftime("%Y-%m-%d"), timeframe[1].strftime("%Y-%m-%d"))
 
-                earliest_timestamp = "SELECT `date` FROM `stock_data` WHERE `ticker` = '{}' ORDER BY `date` ASC LIMIT 1;".format(
-                    ticker)
-                cursor.execute(earliest_timestamp)
-                results = cursor.fetchall()
+        limit_string = ";" if not limit else " LIMIT {};".format(limit)
 
-                if not results:
-                    raise Exception(
-                        "Ticker value `{}` not found".format(ticker))
+        select_query += " ORDER BY `{}` DESC{}".format(
+            "date" if not live else "timestamp", limit_string)
 
-                time_period[0] = results[0]['date']
-                time_period[0] = time_period[0].strftime(
-                    "%Y:%m:%d 00:00:00")
+        frames = []
+        for ticker in tickers:
 
-            sql = sql + \
-                " AND `date` BETWEEN '{}' AND '{}'".format(
-                    time_period[0], time_period[1])
-        if limit:
-            sql = sql + " LIMIT {}".format(limit)
-        sql = sql + " ORDER BY `date` DESC;"
-        cursor.execute(sql)
-        results = cursor.fetchall()
-        cursor.close()
+            cursor.execute(select_query, ticker)
+            results = cursor.fetchall()
 
-        if not results:
+            if not results:
+                continue
 
-            return False
-
-        if time_normalized:
-
-            result_datetimes = [x['date'] for x in results]
-            norm_results = []
-            times = [results[0]['date'], results[len(results) - 1]['date']]
-
-            diff = (times[0] - times[1]).days
-            for d in range(diff):
-                dt = times[len(times) - 1] + datetime.timedelta(days=d)
-                if dt not in result_datetimes:
-                    norm_results.append({
-                        "ticker": ticker,
-                        "date": dt,
-                        "open": np.nan,
-                        "high": np.nan,
-                        "low": np.nan,
-                        "close": np.nan,
-                        "volume": np.nan})
-                else:
-                    idx = result_datetimes.index(dt)
-                    norm_results.append(results[idx])
-            results = norm_results
-
-        if dataframe:
-            results = DataFrame(results)
-
-        return results
+            # convert each result to a dataframe
+            frames.append(DataFrame(results).set_index(
+                "date" if not live else "timestamp"))
+        return frames
 
     def get_stock_list(self):
         """
@@ -141,7 +116,6 @@ class RankDB():
         rank_keys = ['week_start', 'week_end',
                      'average_volume', 'num_stocks', 'ranking']
         if set(ranking_object.keys()) != set(rank_keys):
-            print(list(ranking_object.keys()))
             return False
 
         r = ranking_object
@@ -184,7 +158,7 @@ class RankDB():
         """
         cursor = self.db.cursor()
 
-        query = "SELECT `published_on`, `sentiment` from `article_sentiment_cache` WHERE match(ticker) against (%s in boolean mode)"
+        query = "SELECT `published_on`, `sentiment` from `article_sentiment_cache` WHERE `ticker` = %s"
 
         if time_period:
             start = time_period[0]
@@ -196,11 +170,9 @@ class RankDB():
 
         if time_period:
             cursor.execute(query, (ticker, start, end))
-
-            results = cursor.fetchall()
-
         else:
             cursor.execute(query, ticker)
+        results = cursor.fetchall()
         return results
 
     def test(self):
@@ -215,5 +187,3 @@ class RankDB():
         results = cursor.fetchall()
         cursor.execute(q2, (d1, d2))
         res2 = cursor.fetchall()
-        print(results[0]['COUNT(*)'])
-        print(res2[0]['COUNT(*)'])
